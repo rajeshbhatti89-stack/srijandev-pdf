@@ -14,10 +14,12 @@ import {
   StampAnnotation,
   WatermarkConfig,
   getFontFamilyCss,
+  extractPageTextItems,
+  EditablePdfTextItem,
 } from "@/lib/pdfUtils";
 import EditorToolbar, { ToolMode } from "./EditorToolbar";
 import PageThumbnails from "./PageThumbnails";
-import { FileUp, FilePlus2, Sparkles, AlertCircle, X, Trash2, Move } from "lucide-react";
+import { FileUp, FilePlus2, Sparkles, AlertCircle, X, Trash2, Move, Check } from "lucide-react";
 import { PDFDocument } from "pdf-lib";
 
 export default function PdfEditor() {
@@ -74,6 +76,10 @@ export default function PdfEditor() {
   const [shapes, setShapes] = useState<ShapeAnnotation[]>([]);
   const [stamps, setStamps] = useState<StampAnnotation[]>([]);
 
+  // Original PDF in-place editable text items
+  const [editableTexts, setEditableTexts] = useState<EditablePdfTextItem[]>([]);
+  const [activeEditingId, setActiveEditingId] = useState<string | null>(null);
+
   // Selection & Dragging State
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [draggingItem, setDraggingItem] = useState<{
@@ -129,6 +135,14 @@ export default function PdfEditor() {
       }
       setPages(initialPages);
       setCurrentPageIndex(0);
+
+      // Extract original text items from all pages for direct in-place editing
+      const extractedAll: EditablePdfTextItem[] = [];
+      for (let i = 0; i < initialPages.length; i++) {
+        const items = await extractPageTextItems(loadedPdf, i, initialPages[i]);
+        extractedAll.push(...items);
+      }
+      setEditableTexts(extractedAll);
     } catch (err: any) {
       console.error(err);
       setErrorMessage(err.message || "Failed to load PDF file");
@@ -346,7 +360,7 @@ export default function PdfEditor() {
       return;
     }
 
-    if (toolMode === "highlight" || toolMode === "redact") {
+    if (toolMode === "highlight" || toolMode === "redact" || toolMode === "whiteout") {
       setDragStart({ x, y });
       setDragCurrent({ x, y });
       return;
@@ -364,7 +378,7 @@ export default function PdfEditor() {
       return;
     }
 
-    if (dragStart && (toolMode === "highlight" || toolMode === "redact")) {
+    if (dragStart && (toolMode === "highlight" || toolMode === "redact" || toolMode === "whiteout")) {
       setDragCurrent({ x, y });
       return;
     }
@@ -406,13 +420,15 @@ export default function PdfEditor() {
     }
     setIsDrawing(false);
 
-    if (dragStart && dragCurrent && (toolMode === "highlight" || toolMode === "redact")) {
+    if (dragStart && dragCurrent && (toolMode === "highlight" || toolMode === "redact" || toolMode === "whiteout")) {
       const x = Math.min(dragStart.x, dragCurrent.x);
       const y = Math.min(dragStart.y, dragCurrent.y);
       const width = Math.abs(dragCurrent.x - dragStart.x);
       const height = Math.abs(dragCurrent.y - dragStart.y);
 
       if (width > 0.5 && height > 0.5) {
+        const shapeType = toolMode === "highlight" ? "highlight" : toolMode === "redact" ? "redact" : "whiteout";
+        const shapeColor = toolMode === "highlight" ? "#facc15" : toolMode === "redact" ? "#000000" : "#ffffff";
         const newShape: ShapeAnnotation = {
           id: "shape-" + Date.now(),
           pageIndex: currentPageIndex,
@@ -420,8 +436,8 @@ export default function PdfEditor() {
           y,
           width,
           height,
-          type: toolMode === "highlight" ? "highlight" : "redact",
-          color: toolMode === "highlight" ? "#facc15" : "#000000",
+          type: shapeType,
+          color: shapeColor,
         };
         setShapes((prev) => [...prev, newShape]);
       }
@@ -443,6 +459,7 @@ export default function PdfEditor() {
       const exportedBytes = await exportModifiedPdf({
         originalPdfBytes: pdfBytes,
         pages,
+        editableTexts,
         textAnnotations,
         drawings,
         shapes,
@@ -467,6 +484,9 @@ export default function PdfEditor() {
   const currentPageDrawings = drawings.filter((d) => d.pageIndex === currentPageIndex);
   const currentPageShapes = shapes.filter((s) => s.pageIndex === currentPageIndex);
   const currentPageStamps = stamps.filter((s) => s.pageIndex === currentPageIndex);
+  const currentPageEditableTexts = editableTexts.filter(
+    (t) => t.pageIndex === currentPageIndex && !t.isDeleted
+  );
 
   return (
     <div className="flex-1 flex flex-col h-full overflow-hidden bg-gray-100 dark:bg-gray-950">
@@ -612,6 +632,185 @@ export default function PdfEditor() {
                 ref={pageCanvasRef}
                 className="absolute inset-0 w-full h-full pointer-events-none"
               />
+
+              {/* Interactive In-Place Editable Original PDF Texts */}
+              {currentPageEditableTexts.map((item) => {
+                const isEditing = activeEditingId === item.id;
+                const isModified = item.isModified;
+
+                return (
+                  <div
+                    key={item.id}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setActiveEditingId(item.id);
+                      setSelectedId(null);
+                    }}
+                    className={`absolute transition-all ${
+                      isEditing
+                        ? "z-40 ring-2 ring-indigo-600 bg-white shadow-xl rounded"
+                        : isModified
+                        ? "z-20 bg-white ring-1 ring-emerald-500 rounded hover:ring-2 cursor-pointer"
+                        : "z-10 hover:bg-indigo-50/70 hover:ring-1 hover:ring-indigo-400 cursor-text rounded-sm"
+                    }`}
+                    style={{
+                      left: `${item.x}%`,
+                      top: `${item.y}%`,
+                      minWidth: `${item.width}%`,
+                      minHeight: `${item.height}%`,
+                    }}
+                    title="Click to edit or delete this text (सीधे बदलें या मिटाएं)"
+                  >
+                    {/* Floating Toolbar when editing this text block */}
+                    {isEditing && (
+                      <div
+                        className="absolute -top-10 left-0 flex items-center gap-1.5 bg-gray-900 text-white rounded-lg px-2.5 py-1 text-xs shadow-2xl z-50 whitespace-nowrap"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        {/* Language / Font Switcher */}
+                        <button
+                          onClick={() =>
+                            setEditableTexts((prev) =>
+                              prev.map((t) =>
+                                t.id === item.id
+                                  ? {
+                                      ...t,
+                                      fontFamily:
+                                        t.fontFamily === "hindi" ? "sans" : "hindi",
+                                    }
+                                  : t
+                              )
+                            )
+                          }
+                          className="px-2 py-0.5 bg-gray-800 hover:bg-gray-700 rounded text-[11px] font-medium text-indigo-300"
+                          title="Switch between Hindi & English font"
+                        >
+                          {item.fontFamily === "hindi" ? "🇮🇳 हिन्दी" : "🇬🇧 English"}
+                        </button>
+
+                        {/* Size Controls */}
+                        <button
+                          onClick={() =>
+                            setEditableTexts((prev) =>
+                              prev.map((t) =>
+                                t.id === item.id
+                                  ? { ...t, fontSize: Math.max(8, t.fontSize - 1) }
+                                  : t
+                              )
+                            )
+                          }
+                          className="px-1.5 py-0.5 hover:bg-gray-800 rounded font-bold text-gray-300"
+                        >
+                          -
+                        </button>
+                        <span className="font-mono text-[11px] text-gray-200">
+                          {item.fontSize}pt
+                        </span>
+                        <button
+                          onClick={() =>
+                            setEditableTexts((prev) =>
+                              prev.map((t) =>
+                                t.id === item.id
+                                  ? { ...t, fontSize: t.fontSize + 1 }
+                                  : t
+                              )
+                            )
+                          }
+                          className="px-1.5 py-0.5 hover:bg-gray-800 rounded font-bold text-gray-300"
+                        >
+                          +
+                        </button>
+
+                        {/* Delete / Erase original text */}
+                        <button
+                          onClick={() => {
+                            setEditableTexts((prev) =>
+                              prev.map((t) =>
+                                t.id === item.id
+                                  ? { ...t, isDeleted: true, isModified: true }
+                                  : t
+                              )
+                            );
+                            setActiveEditingId(null);
+                          }}
+                          className="p-1 hover:bg-red-600 rounded text-red-400 hover:text-white ml-1"
+                          title="Delete original text (मिटाएं)"
+                        >
+                          <Trash2 size={13} />
+                        </button>
+
+                        {/* Done / Check */}
+                        <button
+                          onClick={() => setActiveEditingId(null)}
+                          className="p-1 hover:bg-emerald-600 rounded text-emerald-400 hover:text-white"
+                          title="Done editing (हो गया)"
+                        >
+                          <Check size={13} />
+                        </button>
+                      </div>
+                    )}
+
+                    {/* Editing text area with full keyboard input support */}
+                    {isEditing ? (
+                      <textarea
+                        autoFocus
+                        value={item.text}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setEditableTexts((prev) =>
+                            prev.map((t) =>
+                              t.id === item.id
+                                ? {
+                                    ...t,
+                                    text: val,
+                                    isModified: true,
+                                    isDeleted: val.trim() === "",
+                                    fontFamily: /[\u0900-\u097F]/.test(val)
+                                      ? "hindi"
+                                      : t.fontFamily,
+                                  }
+                                : t
+                            )
+                          );
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === "Escape") {
+                            setActiveEditingId(null);
+                          }
+                        }}
+                        className="bg-white text-gray-900 border-0 outline-none p-0.5 resize-none block w-full leading-tight font-inherit"
+                        style={{
+                          fontSize: `${item.fontSize * zoom}px`,
+                          fontFamily: getFontFamilyCss(item.fontFamily),
+                          color: item.color || "#000000",
+                        }}
+                        rows={Math.max(1, item.text.split("\n").length)}
+                      />
+                    ) : isModified ? (
+                      <div
+                        className="bg-white p-0.5 whitespace-pre-wrap leading-tight block w-full"
+                        style={{
+                          fontSize: `${item.fontSize * zoom}px`,
+                          fontFamily: getFontFamilyCss(item.fontFamily),
+                          color: item.color || "#000000",
+                        }}
+                      >
+                        {item.text}
+                      </div>
+                    ) : (
+                      /* Transparent overlay that captures clicks directly on the original text */
+                      <div
+                        className="opacity-0 hover:opacity-10 p-0.5 text-transparent select-none whitespace-pre-wrap leading-tight text-[0px] w-full h-full"
+                        style={{
+                          minHeight: "14px",
+                        }}
+                      >
+                        {item.text}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
 
               {/* Watermark Overlay (Real-time Preview) */}
               {watermark.enabled && watermark.text && (

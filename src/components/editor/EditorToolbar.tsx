@@ -19,10 +19,11 @@ import {
   FolderPlus,
   Droplet,
   Languages,
+  Eraser,
 } from "lucide-react";
 import { WatermarkConfig } from "@/lib/pdfUtils";
 
-export type ToolMode = "select" | "text" | "draw" | "highlight" | "redact" | "stamp";
+export type ToolMode = "select" | "text" | "draw" | "highlight" | "redact" | "whiteout" | "stamp";
 
 interface EditorToolbarProps {
   toolMode: ToolMode;
@@ -222,6 +223,19 @@ export default function EditorToolbar({
           >
             <Square size={14} className="fill-current" />
             <span>Redact</span>
+          </button>
+
+          <button
+            onClick={() => setToolMode("whiteout")}
+            title="Eraser / Whiteout - Erase any section of original PDF"
+            className={`flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
+              toolMode === "whiteout"
+                ? "bg-indigo-600 text-white shadow-sm"
+                : "text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800"
+            }`}
+          >
+            <Eraser size={14} />
+            <span>Eraser (मिटाएं)</span>
           </button>
 
           <button

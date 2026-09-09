@@ -28,8 +28,26 @@ export interface ShapeAnnotation {
   y: number; // percentage
   width: number; // percentage
   height: number; // percentage
-  type: "highlight" | "redact" | "box";
+  type: "highlight" | "redact" | "whiteout" | "box";
   color: string;
+}
+
+export interface EditablePdfTextItem {
+  id: string;
+  pageIndex: number;
+  originalText: string;
+  text: string;
+  isDeleted: boolean;
+  isModified: boolean;
+  x: number; // percentage (0 - 100)
+  y: number; // percentage (0 - 100)
+  width: number; // percentage (0 - 100)
+  height: number; // percentage (0 - 100)
+  fontSize: number; // in pt
+  fontFamily: "hindi" | "sans" | "serif" | "mono";
+  color: string;
+  bold?: boolean;
+  italic?: boolean;
 }
 
 export interface StampAnnotation {
@@ -198,10 +216,113 @@ export function getFontFamilyCss(family: "hindi" | "sans" | "serif" | "mono"): s
   }
 }
 
+// Extract text items directly from PDF page for in-place editing
+export async function extractPageTextItems(
+  pdfDocProxy: any,
+  pageIndex: number,
+  pageMeta: PageInfo
+): Promise<EditablePdfTextItem[]> {
+  if (!pdfDocProxy) return [];
+  try {
+    const page = await pdfDocProxy.getPage(pageMeta.originalIndex + 1);
+    const textContent = await page.getTextContent();
+    const rawItems = textContent.items || [];
+    if (rawItems.length === 0) return [];
+
+    const pageWidth = pageMeta.width;
+    const pageHeight = pageMeta.height;
+
+    const validItems: {
+      str: string;
+      tx: number;
+      ty: number;
+      width: number;
+      height: number;
+      fontSize: number;
+    }[] = [];
+
+    for (const item of rawItems) {
+      if (!item.str || item.str.trim() === "") continue;
+      const [scaleX, skewY, skewX, scaleY, tx, ty] = item.transform;
+      const fontSize = Math.abs(scaleY) || Math.abs(scaleX) || 12;
+      validItems.push({
+        str: item.str,
+        tx,
+        ty,
+        width: item.width || fontSize * item.str.length * 0.55,
+        height: item.height || fontSize,
+        fontSize,
+      });
+    }
+
+    if (validItems.length === 0) return [];
+
+    // Sort top-to-bottom then left-to-right
+    validItems.sort((a, b) => {
+      if (Math.abs(b.ty - a.ty) > 3) return b.ty - a.ty;
+      return a.tx - b.tx;
+    });
+
+    const lines: typeof validItems = [];
+    let currentLine: (typeof validItems)[0] | null = null;
+
+    for (const item of validItems) {
+      if (!currentLine) {
+        currentLine = { ...item };
+      } else {
+        const isSameLine = Math.abs(currentLine.ty - item.ty) <= 4;
+        const isClose =
+          item.tx >= currentLine.tx &&
+          item.tx <= currentLine.tx + currentLine.width + item.fontSize * 1.6;
+
+        if (isSameLine && isClose) {
+          currentLine.str +=
+            (item.tx > currentLine.tx + currentLine.width + 1 ? " " : "") + item.str;
+          currentLine.width = item.tx + item.width - currentLine.tx;
+        } else {
+          lines.push(currentLine);
+          currentLine = { ...item };
+        }
+      }
+    }
+    if (currentLine) lines.push(currentLine);
+
+    return lines.map((line, idx) => {
+      const xPct = Math.max(0, Math.min(96, (line.tx / pageWidth) * 100));
+      const topPt = pageHeight - line.ty - line.fontSize * 0.88;
+      const yPct = Math.max(0, Math.min(98, (topPt / pageHeight) * 100));
+      const wPct = Math.max(2, Math.min(100 - xPct, ((line.width + 10) / pageWidth) * 100));
+      const hPct = Math.max(1.5, Math.min(100 - yPct, ((line.fontSize * 1.35) / pageHeight) * 100));
+
+      const isHindi = /[\u0900-\u097F]/.test(line.str);
+
+      return {
+        id: `pdf-text-${pageIndex}-${idx}`,
+        pageIndex,
+        originalText: line.str,
+        text: line.str,
+        isDeleted: false,
+        isModified: false,
+        x: xPct,
+        y: yPct,
+        width: wPct,
+        height: hPct,
+        fontSize: Math.max(12, Math.round(line.fontSize)),
+        fontFamily: isHindi ? "hindi" : "sans",
+        color: "#000000",
+      };
+    });
+  } catch (err) {
+    console.error("Failed to extract text items:", err);
+    return [];
+  }
+}
+
 // Export final PDF document burning all annotations & transforms
 export async function exportModifiedPdf({
   originalPdfBytes,
   pages,
+  editableTexts = [],
   textAnnotations,
   drawings,
   shapes,
@@ -210,6 +331,7 @@ export async function exportModifiedPdf({
 }: {
   originalPdfBytes: Uint8Array;
   pages: PageInfo[];
+  editableTexts?: EditablePdfTextItem[];
   textAnnotations: TextAnnotation[];
   drawings: DrawingPath[];
   shapes: ShapeAnnotation[];
@@ -237,11 +359,14 @@ export async function exportModifiedPdf({
     const pageWidth = addedPage.getWidth();
     const pageHeight = addedPage.getHeight();
 
-    // Check if this page has annotations or watermark
+    // Check if this page has annotations or watermark or modified original text
     const pageTexts = textAnnotations.filter((t) => t.pageIndex === pageMeta.pageIndex);
     const pageDrawings = drawings.filter((d) => d.pageIndex === pageMeta.pageIndex);
     const pageShapes = shapes.filter((s) => s.pageIndex === pageMeta.pageIndex);
     const pageStamps = stamps.filter((s) => s.pageIndex === pageMeta.pageIndex);
+    const pageEditableTexts = editableTexts.filter(
+      (t) => t.pageIndex === pageMeta.pageIndex && (t.isModified || t.isDeleted)
+    );
 
     const hasWatermark = watermark.enabled && watermark.text.trim().length > 0;
     const hasAnnotations =
@@ -249,6 +374,7 @@ export async function exportModifiedPdf({
       pageDrawings.length > 0 ||
       pageShapes.length > 0 ||
       pageStamps.length > 0 ||
+      pageEditableTexts.length > 0 ||
       hasWatermark;
 
     if (hasAnnotations) {
@@ -262,7 +388,40 @@ export async function exportModifiedPdf({
       if (ctx) {
         ctx.scale(scale, scale);
 
-        // 1. Draw Watermark if enabled
+        // 1. Erase / Whiteout any modified or deleted original PDF texts, and draw new text
+        pageEditableTexts.forEach((item) => {
+          const x = (item.x / 100) * pageWidth;
+          const y = (item.y / 100) * pageHeight;
+          const w = (item.width / 100) * pageWidth;
+          const h = (item.height / 100) * pageHeight;
+
+          // Mask old text completely with opaque white
+          ctx.save();
+          ctx.globalAlpha = 1.0;
+          ctx.fillStyle = "#ffffff";
+          ctx.fillRect(x - 2, y - 2, w + 4, h + 4);
+          ctx.restore();
+
+          // If modified and not deleted, draw replacement text in Hindi / English
+          if (!item.isDeleted && item.text && item.text.trim().length > 0) {
+            ctx.save();
+            const weight = item.bold ? "bold " : "";
+            const style = item.italic ? "italic " : "";
+            const fontFam = getFontFamilyCss(item.fontFamily);
+
+            ctx.font = `${style}${weight}${item.fontSize}px ${fontFam}`;
+            ctx.fillStyle = item.color || "#000000";
+            ctx.textBaseline = "top";
+
+            const lines = item.text.split("\n");
+            lines.forEach((line, lineIdx) => {
+              ctx.fillText(line, x, y + lineIdx * (item.fontSize * 1.25));
+            });
+            ctx.restore();
+          }
+        });
+
+        // 2. Draw Watermark if enabled
         if (hasWatermark) {
           ctx.save();
           ctx.translate(pageWidth / 2, pageHeight / 2);
@@ -276,7 +435,7 @@ export async function exportModifiedPdf({
           ctx.restore();
         }
 
-        // 2. Draw Shapes (Highlights & Redactions)
+        // 3. Draw Shapes (Highlights, Redactions & Whiteouts)
         pageShapes.forEach((shape) => {
           const x = (shape.x / 100) * pageWidth;
           const y = (shape.y / 100) * pageHeight;
@@ -291,6 +450,10 @@ export async function exportModifiedPdf({
           } else if (shape.type === "redact") {
             ctx.globalAlpha = 1.0;
             ctx.fillStyle = "#000000";
+            ctx.fillRect(x, y, w, h);
+          } else if (shape.type === "whiteout") {
+            ctx.globalAlpha = 1.0;
+            ctx.fillStyle = "#ffffff";
             ctx.fillRect(x, y, w, h);
           } else {
             ctx.globalAlpha = 1.0;
